@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Build the shared library
+    const lib = b.addSharedLibrary(.{
+        .name = "hot_module",
+        .root_source_file = .{ .path = "src/hot_module.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Build the main executable
     const exe = b.addExecutable(.{
         .name = "hot-reload-example",
         .root_source_file = .{ .path = "src/main.zig" },
@@ -11,6 +20,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Install both artifacts
+    b.installArtifact(lib);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

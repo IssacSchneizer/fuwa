@@ -1,7 +1,7 @@
 const std = @import("std");
 
-// This function will be reloaded when the file changes
-pub fn run() !void {
+// Export the function so it can be loaded dynamically
+export fn run() callconv(.C) void {
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("Hot module v2 executed at: {}\n", .{std.time.timestamp()});
+    stdout.print("Hot module v2 executed at: {}\n", .{std.time.timestamp()}) catch return;
 }
