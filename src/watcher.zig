@@ -47,9 +47,11 @@ pub const Watcher = struct {
         var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
         while (true) {
             const len_isize = std.os.linux.read(fd, &buf, buf.len);
-            if (len_isize < 0) {
-                const err = std.os.linux.getErrno(@as(usize, @bitCast(len_isize)));
-                if (err == .AGAIN) {
+            const len_err = @as(isize, @bitCast(len_isize));
+            if (len_err < 0) {
+                // In Zig 0.12.0, use E.AGAIN etc directly or check the error number
+                const err_val = @as(isize, @bitCast(@as(usize, @bitCast(len_isize))));
+                if (err_val == -@as(isize, @intCast(@intFromEnum(std.os.linux.E.AGAIN)))) {
                     std.time.sleep(100 * std.time.ns_per_ms);
                     continue;
                 }
@@ -59,14 +61,23 @@ pub const Watcher = struct {
 
             var i: usize = 0;
             while (i < len) {
-                const event_ptr = @as([*]const u8, @ptrCast(&buf[i]));
-                const event = @as(*const std.os.linux.inotify_event, @ptrCast(@alignCast(event_ptr)));
+                if (i + @sizeOf(std.os.linux.inotify_event) > len) break;
+
+                const event = @as(*const std.os.linux.inotify_event, @ptrCast(@alignCast(&buf[i])));
                 
                 if (event.len > 0) {
-                    const name_ptr = event_ptr + @sizeOf(std.os.linux.inotify_event);
-                    const name = std.mem.sliceTo(name_ptr[0..event.len], 0);
-                    if (name.len > 0) {
-                        self.callback(name);
+                    const name_start = i + @sizeOf(std.os.linux.inotify_event);
+                    const name_end = name_start + event.len;
+                    
+                    if (name_end <= len) {
+                        const name_ptr = @as([*]const u8, @ptrCast(event)) + @sizeOf(std.os.linux.inotify_event);
+                        const actual_name_len = std.mem.indexOfScalar(u8, name_ptr[0..event.len], 0) orelse event.len;
+                        const name = name_ptr[0..actual_name_len];
+                        if (name.len > 0) {
+                            self.callback(name);
+                        } else {
+                            self.callback(path);
+                        }
                     } else {
                         self.callback(path);
                     }
@@ -80,9 +91,6 @@ pub const Watcher = struct {
     }
 
     fn watchMacOS(self: *Watcher, path: []const u8) !void {
-        // macOS FSEvents requires linking CoreServices. For a "libc-only" feel, 
-        // one might use kqueue for simple file watching, but FSEvents is preferred for directories.
-        // Since we are limited to std/libc, kqueue is more 'portable' in terms of dependency.
         const kq = std.os.kqueue() catch return error.KqueueInitFailed;
         defer std.os.close(kq);
 
