@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Channel = @import("channel.zig").Channel;
+const channel_mod = @import("channel.zig");
 
 pub const WatchRequest = union(enum) {
     Add: struct {
@@ -23,7 +23,7 @@ const WatchNode = struct {
     path: []const u8,
     recursive: bool,
     os_handle: if (builtin.os.tag == .linux) i32 else if (builtin.os.tag == .windows) std.os.windows.HANDLE else usize,
-    wd: i32 = -1, // for inotify
+    wd: i32 = -1,
 
     fn deinit(self: *WatchNode, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -32,8 +32,8 @@ const WatchNode = struct {
 
 pub const Watcher = struct {
     allocator: std.mem.Allocator,
-    input_chan: Channel(WatchRequest),
-    output_chan: Channel(WatchEvent),
+    input_chan: channel_mod.Channel(WatchRequest),
+    output_chan: channel_mod.Channel(WatchEvent),
     path_to_node: std.StringHashMap(*WatchNode),
     wd_to_node: std.AutoHashMap(i32, *WatchNode),
     thread: ?std.Thread = null,
@@ -43,8 +43,8 @@ pub const Watcher = struct {
         const self = try allocator.create(Watcher);
         self.* = .{
             .allocator = allocator,
-            .input_chan = Channel(WatchRequest).init(allocator),
-            .output_chan = Channel(WatchEvent).init(allocator),
+            .input_chan = .{ .allocator = allocator },
+            .output_chan = .{ .allocator = allocator },
             .path_to_node = std.StringHashMap(*WatchNode).init(allocator),
             .wd_to_node = std.AutoHashMap(i32, *WatchNode).init(allocator),
         };
@@ -84,7 +84,6 @@ pub const Watcher = struct {
 
         var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
         while (self.running) {
-            // Drain requests
             while (self.input_chan.tryPop()) |req| {
                 switch (req) {
                     .Add => |add| {
@@ -116,7 +115,6 @@ pub const Watcher = struct {
                 }
             }
 
-            // Read events
             const len_isize = std.os.linux.read(fd, &buf, buf.len);
             const len_err = @as(isize, @bitCast(len_isize));
             if (len_err > 0) {
