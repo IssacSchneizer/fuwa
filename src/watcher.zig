@@ -23,16 +23,10 @@ const WatchNode = struct {
     path: []const u8,
     recursive: bool,
     os_handle: if (builtin.os.tag == .linux) i32 else if (builtin.os.tag == .windows) std.os.windows.HANDLE else usize,
-    children: std.StringHashMap(*WatchNode),
+    wd: i32 = -1, // for inotify
 
     fn deinit(self: *WatchNode, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
-        var it = self.children.valueIterator();
-        while (it.next()) |child| {
-            child.*.deinit(allocator);
-            allocator.destroy(child.*);
-        }
-        self.children.deinit();
     }
 };
 
@@ -41,6 +35,7 @@ pub const Watcher = struct {
     input_chan: Channel(WatchRequest),
     output_chan: Channel(WatchEvent),
     path_to_node: std.StringHashMap(*WatchNode),
+    wd_to_node: std.AutoHashMap(i32, *WatchNode),
     thread: ?std.Thread = null,
     running: bool = false,
 
@@ -51,6 +46,7 @@ pub const Watcher = struct {
             .input_chan = Channel(WatchRequest).init(allocator),
             .output_chan = Channel(WatchEvent).init(allocator),
             .path_to_node = std.StringHashMap(*WatchNode).init(allocator),
+            .wd_to_node = std.AutoHashMap(i32, *WatchNode).init(allocator),
         };
         return self;
     }
@@ -66,6 +62,7 @@ pub const Watcher = struct {
             self.allocator.destroy(node.*);
         }
         self.path_to_node.deinit();
+        self.wd_to_node.deinit();
         self.allocator.destroy(self);
     }
 
@@ -78,7 +75,6 @@ pub const Watcher = struct {
         if (builtin.os.tag == .linux) {
             self.loopLinux() catch |err| std.debug.print("Watcher loop error: {}\n", .{err});
         }
-        // Other backends...
     }
 
     fn loopLinux(self: *Watcher) !void {
@@ -96,20 +92,25 @@ pub const Watcher = struct {
                         defer self.allocator.free(path_c);
                         const wd_usize = std.os.linux.inotify_add_watch(fd, path_c.ptr, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE | std.os.linux.IN.DELETE_SELF | std.os.linux.IN.MOVE_SELF);
                         const wd: i32 = @intCast(wd_usize);
-                        
+                        if (wd < 0) continue;
+
                         const node = try self.allocator.create(WatchNode);
                         node.* = .{
                             .path = try self.allocator.dupe(u8, add.path),
                             .recursive = add.recursive,
-                            .os_handle = wd,
-                            .children = std.StringHashMap(*WatchNode).init(self.allocator),
+                            .os_handle = fd,
+                            .wd = wd,
                         };
                         try self.path_to_node.put(node.path, node);
+                        try self.wd_to_node.put(wd, node);
                     },
                     .Remove => |rem| {
-                        if (self.path_to_node.get(rem.path)) |node| {
-                            _ = std.os.linux.inotify_rm_watch(fd, node.os_handle);
-                            // Cleanup node logic...
+                        if (self.path_to_node.fetchRemove(rem.path)) |kv| {
+                            const node = kv.value;
+                            _ = std.os.linux.inotify_rm_watch(fd, node.wd);
+                            _ = self.wd_to_node.remove(node.wd);
+                            node.deinit(self.allocator);
+                            self.allocator.destroy(node);
                         }
                     },
                 }
@@ -123,8 +124,26 @@ pub const Watcher = struct {
                 var i: usize = 0;
                 while (i < len) {
                     const event = @as(*const std.os.linux.inotify_event, @ptrCast(@alignCast(&buf[i])));
-                    // Normalize and push to output_chan
-                    try self.output_chan.push(.Modified, .{ .path = "dummy" }); // Placeholder
+                    if (self.wd_to_node.get(event.wd)) |node| {
+                        if (event.len > 0) {
+                            const name_ptr = @as([*]const u8, @ptrCast(event)) + @sizeOf(std.os.linux.inotify_event);
+                            const actual_name_len = std.mem.indexOfScalar(u8, name_ptr[0..event.len], 0) orelse event.len;
+                            const name = name_ptr[0..actual_name_len];
+                            
+                            const full_path = try std.fs.path.join(self.allocator, &.{ node.path, name });
+                            defer self.allocator.free(full_path);
+
+                            if (event.mask & (std.os.linux.IN.CREATE | std.os.linux.IN.MOVED_TO) != 0) {
+                                try self.output_chan.push(.{ .Added = try self.allocator.dupe(u8, full_path) });
+                            } else if (event.mask & (std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM) != 0) {
+                                try self.output_chan.push(.{ .Removed = try self.allocator.dupe(u8, full_path) });
+                            } else if (event.mask & std.os.linux.IN.MODIFY != 0) {
+                                try self.output_chan.push(.{ .Modified = try self.allocator.dupe(u8, full_path) });
+                            }
+                        } else {
+                             try self.output_chan.push(.{ .Modified = try self.allocator.dupe(u8, node.path) });
+                        }
+                    }
                     i += @sizeOf(std.os.linux.inotify_event) + event.len;
                 }
             }

@@ -12,12 +12,26 @@ pub fn main() !void {
     try watcher.start();
     try watcher.input_chan.push(.{ .Add = .{ .path = ".", .recursive = true } });
 
-    std.debug.print("Watching... Press Ctrl+C to stop.\n", .{});
+    std.debug.print("Watching directory: . (Press Ctrl+C to stop)\n", .{});
     while (true) {
         while (watcher.output_chan.tryPop()) |event| {
             switch (event) {
-                .Modified => |path| std.debug.print("Modified: {s}\n", .{path}),
-                else => |e| std.debug.print("Event: {}\n", .{e}),
+                .Added => |path| {
+                    std.debug.print("[ADDED] {s}\n", .{path});
+                    allocator.free(path);
+                },
+                .Removed => |path| {
+                    std.debug.print("[REMOVED] {s}\n", .{path});
+                    allocator.free(path);
+                },
+                .Modified => |path| {
+                    std.debug.print("[MODIFIED] {s}\n", .{path});
+                    allocator.free(path);
+                },
+                .Rescan => |path| {
+                    std.debug.print("[RESCAN] {s}\n", .{path});
+                    allocator.free(path);
+                },
             }
         }
         std.time.sleep(100 * std.time.ns_per_ms);
