@@ -22,7 +22,6 @@ pub const WatchEvent = union(enum) {
 const WatchNode = struct {
     path: []const u8,
     recursive: bool,
-    os_handle: if (builtin.os.tag == .linux) i32 else if (builtin.os.tag == .windows) std.os.windows.HANDLE else usize,
     wd: i32 = -1,
 
     fn deinit(self: *WatchNode, allocator: std.mem.Allocator) void {
@@ -77,32 +76,50 @@ pub const Watcher = struct {
         }
     }
 
+    fn addWatchRecursive(self: *Watcher, fd: i32, path: []const u8, recursive: bool) !void {
+        const path_c = try self.allocator.dupeZ(u8, path);
+        defer self.allocator.free(path_c);
+
+        const wd_usize = std.os.linux.inotify_add_watch(fd, path_c.ptr, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE | std.os.linux.IN.DELETE_SELF | std.os.linux.IN.MOVE_SELF);
+        const wd: i32 = @intCast(wd_usize);
+        if (wd < 0) return;
+
+        if (!self.path_to_node.contains(path)) {
+            const node = try self.allocator.create(WatchNode);
+            node.* = .{
+                .path = try self.allocator.dupe(u8, path),
+                .recursive = recursive,
+                .wd = wd,
+            };
+            try self.path_to_node.put(node.path, node);
+            try self.wd_to_node.put(wd, node);
+        }
+
+        if (recursive) {
+            var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return;
+            defer dir.close();
+            var it = dir.iterate();
+            while (try it.next()) |entry| {
+                if (entry.kind == .directory) {
+                    const sub_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
+                    defer self.allocator.free(sub_path);
+                    try self.addWatchRecursive(fd, sub_path, true);
+                }
+            }
+        }
+    }
+
     fn loopLinux(self: *Watcher) !void {
         const fd_usize = std.os.linux.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
         const fd: i32 = @intCast(fd_usize);
         defer _ = std.os.linux.close(fd);
 
-        var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
+        var buf: [8192]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
         while (self.running) {
+            // Drain requests
             while (self.input_chan.tryPop()) |req| {
                 switch (req) {
-                    .Add => |add| {
-                        const path_c = try self.allocator.dupeZ(u8, add.path);
-                        defer self.allocator.free(path_c);
-                        const wd_usize = std.os.linux.inotify_add_watch(fd, path_c.ptr, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE | std.os.linux.IN.DELETE_SELF | std.os.linux.IN.MOVE_SELF);
-                        const wd: i32 = @intCast(wd_usize);
-                        if (wd < 0) continue;
-
-                        const node = try self.allocator.create(WatchNode);
-                        node.* = .{
-                            .path = try self.allocator.dupe(u8, add.path),
-                            .recursive = add.recursive,
-                            .os_handle = fd,
-                            .wd = wd,
-                        };
-                        try self.path_to_node.put(node.path, node);
-                        try self.wd_to_node.put(wd, node);
-                    },
+                    .Add => |add| try self.addWatchRecursive(fd, add.path, add.recursive),
                     .Remove => |rem| {
                         if (self.path_to_node.fetchRemove(rem.path)) |kv| {
                             const node = kv.value;
@@ -115,6 +132,7 @@ pub const Watcher = struct {
                 }
             }
 
+            // Read events non-blocking
             const len_isize = std.os.linux.read(fd, &buf, buf.len);
             const len_err = @as(isize, @bitCast(len_isize));
             if (len_err > 0) {
@@ -129,23 +147,30 @@ pub const Watcher = struct {
                             const name = name_ptr[0..actual_name_len];
                             
                             const full_path = try std.fs.path.join(self.allocator, &.{ node.path, name });
-                            defer self.allocator.free(full_path);
-
+                            
                             if (event.mask & (std.os.linux.IN.CREATE | std.os.linux.IN.MOVED_TO) != 0) {
                                 try self.output_chan.push(.{ .Added = try self.allocator.dupe(u8, full_path) });
+                                // If a directory was created and we are in recursive mode, watch it
+                                if (node.recursive) {
+                                    var stat = std.fs.cwd().statFile(full_path) catch null;
+                                    if (stat != null and stat.?.kind == .directory) {
+                                        try self.addWatchRecursive(fd, full_path, true);
+                                    }
+                                }
                             } else if (event.mask & (std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM) != 0) {
                                 try self.output_chan.push(.{ .Removed = try self.allocator.dupe(u8, full_path) });
                             } else if (event.mask & std.os.linux.IN.MODIFY != 0) {
                                 try self.output_chan.push(.{ .Modified = try self.allocator.dupe(u8, full_path) });
                             }
+                            self.allocator.free(full_path);
                         } else {
-                             try self.output_chan.push(.{ .Modified = try self.allocator.dupe(u8, node.path) });
+                            try self.output_chan.push(.{ .Modified = try self.allocator.dupe(u8, node.path) });
                         }
                     }
                     i += @sizeOf(std.os.linux.inotify_event) + event.len;
                 }
             }
-            std.time.sleep(50 * std.time.ns_per_ms);
+            std.time.sleep(10 * std.time.ns_per_ms);
         }
     }
 };
