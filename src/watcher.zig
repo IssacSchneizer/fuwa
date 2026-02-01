@@ -59,7 +59,6 @@ pub const Watcher = struct {
             while (i < len) {
                 const event = @as(*const std.os.linux.inotify_event, @ptrCast(@alignCast(&buf[i])));
                 
-                // If the event has a name, it follows the inotify_event struct
                 if (event.len > 0) {
                     const name_ptr = @as([*]const u8, @ptrCast(event)) + @sizeOf(std.os.linux.inotify_event);
                     const name = std.mem.sliceTo(name_ptr[0..event.len], 0);
@@ -72,7 +71,6 @@ pub const Watcher = struct {
                     self.callback(path);
                 }
                 
-                // Increment i by the size of the struct + the length of the name
                 i += @sizeOf(std.os.linux.inotify_event) + event.len;
             }
         }
