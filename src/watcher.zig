@@ -152,7 +152,7 @@ pub const Watcher = struct {
                                 try self.output_chan.push(.{ .Added = try self.allocator.dupe(u8, full_path) });
                                 // If a directory was created and we are in recursive mode, watch it
                                 if (node.recursive) {
-                                    var stat = std.fs.cwd().statFile(full_path) catch null;
+                                    const stat = std.fs.cwd().statFile(full_path) catch null;
                                     if (stat != null and stat.?.kind == .directory) {
                                         try self.addWatchRecursive(fd, full_path, true);
                                     }
