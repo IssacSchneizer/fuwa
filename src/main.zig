@@ -1,55 +1,26 @@
 const std = @import("std");
 const Watcher = @import("watcher.zig").Watcher;
 
-const RunFn = fn() callconv(.C) void;
-
-const DynamicLib = struct {
-    handle: *std.DynLib,
-    run_fn: RunFn,
-
-    pub fn load(lib_path: []const u8) !DynamicLib {
-        const handle = try std.DynLib.open(lib_path);
-        if (handle.lookup(RunFn, "run")) |run_fn| {
-            return DynamicLib{
-                .handle = handle,
-                .run_fn = run_fn,
-            };
-        }
-        return error.SymbolNotFound;
-    }
-
-    pub fn unload(self: *DynamicLib) void {
-        self.handle.close();
-    }
-};
+fn callback(path: []const u8) void {
+    std.debug.print("Change detected: {s}\n", .{path});
+}
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
-    const stdout = std.io.getStdOut().writer();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
 
-    try stdout.print("Hot Reload Example - Press Ctrl+C to exit\n", .{});
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
-    const lib_path = "zig-out/lib/libhot_module.so";
-    var watcher = try Watcher.init(allocator, lib_path);
+    if (args.len < 2) {
+        std.debug.print("Usage: {s} <path_to_watch>\n", .{args[0]});
+        return;
+    }
+
+    const watcher = try Watcher.init(allocator, callback);
     defer watcher.deinit();
 
-    // Main program loop
-    while (true) {
-        if (try watcher.checkForChanges()) {
-            try stdout.print("\nReloading {s}...\n", .{lib_path});
-
-            // Load the dynamic library
-            var lib = DynamicLib.load(lib_path) catch |err| {
-                try stdout.print("Error loading library: {}\n", .{err});
-                continue;
-            };
-            defer lib.unload();
-
-            // Call the run function
-            lib.run_fn();
-        }
-
-        // Sleep for a short duration to prevent busy waiting
-        std.time.sleep(std.time.ns_per_ms * 100);
-    }
+    std.debug.print("Watching: {s}\n", .{args[1]});
+    try watcher.watch(args[1]);
 }

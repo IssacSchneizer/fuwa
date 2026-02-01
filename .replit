@@ -13,21 +13,21 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "Hot Reload Demo"
+args = "Watcher Demo"
 
 [[workflows.workflow]]
-name = "Hot Reload Demo"
+name = "Watcher Demo"
 author = "agent"
-
-[workflows.workflow.metadata]
-agentRequireRestartOnSave = false
-
-[[workflows.workflow.tasks]]
-task = "packager.installForAll"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "zig build run"
+args = "zig build run -- ."
+
+[workflows.workflow.metadata]
+outputType = "console"
 
 [deployment]
 run = ["sh", "-c", "zig build run"]
+
+[agent]
+expertMode = true
