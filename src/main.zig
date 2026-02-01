@@ -1,26 +1,25 @@
 const std = @import("std");
 const Watcher = @import("watcher.zig").Watcher;
 
-fn callback(path: []const u8) void {
-    std.debug.print("Change detected: {s}\n", .{path});
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
     defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    if (args.len < 2) {
-        std.debug.print("Usage: {s} <path_to_watch>\n", .{args[0]});
-        return;
-    }
-
-    const watcher = try Watcher.init(allocator, callback);
+    const watcher = try Watcher.init(allocator);
     defer watcher.deinit();
 
-    std.debug.print("Watching: {s}\n", .{args[1]});
-    try watcher.watch(args[1]);
+    try watcher.start();
+    try watcher.input_chan.push(.{ .Add = .{ .path = ".", .recursive = true } });
+
+    std.debug.print("Watching... Press Ctrl+C to stop.\n", .{});
+    while (true) {
+        while (watcher.output_chan.tryPop()) |event| {
+            switch (event) {
+                .Modified => |path| std.debug.print("Modified: {s}\n", .{path}),
+                else => |e| std.debug.print("Event: {}\n", .{e}),
+            }
+        }
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
 }
