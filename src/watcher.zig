@@ -31,37 +31,48 @@ pub const Watcher = struct {
     }
 
     fn watchLinux(self: *Watcher, path: []const u8) !void {
-        const fd = std.os.linux.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
-        if (fd < 0) return error.InotifyInitFailed;
+        const fd_usize = std.os.linux.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
+        if (@as(isize, @bitCast(fd_usize)) < 0) return error.InotifyInitFailed;
+        const fd: i32 = @intCast(fd_usize);
         defer _ = std.os.linux.close(fd);
 
-        // Ensure path is null-terminated for inotify_add_watch
         const path_c = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_c);
 
         const wd = std.os.linux.inotify_add_watch(fd, path_c.ptr, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE);
-        if (wd < 0) return error.InotifyWatchFailed;
+        if (@as(isize, @bitCast(wd)) < 0) return error.InotifyWatchFailed;
 
         var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
         while (true) {
-            const len = std.os.linux.read(fd, &buf, buf.len);
-            if (len < 0) {
-                const err = std.os.linux.getErrno(len);
+            const len_isize = std.os.linux.read(fd, &buf, buf.len);
+            if (len_isize < 0) {
+                const err = std.os.linux.getErrno(@as(usize, @bitCast(len_isize)));
                 if (err == .AGAIN) {
                     std.time.sleep(100 * std.time.ns_per_ms);
                     continue;
                 }
                 return error.InotifyReadFailed;
             }
+            const len = @as(usize, @intCast(len_isize));
 
             var i: usize = 0;
-            while (i < @as(usize, @intCast(len))) {
-                const event = @as(*std.os.linux.inotify_event, @ptrCast(@alignCast(&buf[i])));
+            while (i < len) {
+                const event = @as(*const std.os.linux.inotify_event, @ptrCast(@alignCast(&buf[i])));
+                
+                // If the event has a name, it follows the inotify_event struct
                 if (event.len > 0) {
-                    const name_ptr = @as([*]u8, @ptrCast(&event.name));
-                    const name = name_ptr[0..std.mem.indexOfSentinel(u8, 0, name_ptr)];
-                    self.callback(name);
+                    const name_ptr = @as([*]const u8, @ptrCast(event)) + @sizeOf(std.os.linux.inotify_event);
+                    const name = std.mem.sliceTo(name_ptr[0..event.len], 0);
+                    if (name.len > 0) {
+                        self.callback(name);
+                    } else {
+                        self.callback(path);
+                    }
+                } else {
+                    self.callback(path);
                 }
+                
+                // Increment i by the size of the struct + the length of the name
                 i += @sizeOf(std.os.linux.inotify_event) + event.len;
             }
         }
@@ -77,7 +88,7 @@ pub const Watcher = struct {
         const dir_fd = try std.os.open(path, std.os.O.RDONLY, 0);
         defer std.os.close(dir_fd);
 
-        var event = std.os.Kevent{
+        const event = std.os.Kevent{
             .ident = @intCast(dir_fd),
             .filter = std.os.system.EVFILT_VNODE,
             .flags = std.os.system.EV_ADD | std.os.system.EV_ENABLE | std.os.system.EV_CLEAR,
