@@ -23,6 +23,8 @@ const WatchNode = struct {
     path: []const u8,
     recursive: bool,
     wd: i32 = -1,
+    is_stale: bool = false,
+    parent_wd: i32 = -1,
 
     fn deinit(self: *WatchNode, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -35,6 +37,7 @@ pub const Watcher = struct {
     output_chan: channel_mod.Channel(WatchEvent),
     path_to_node: std.StringHashMap(*WatchNode),
     wd_to_node: std.AutoHashMap(i32, *WatchNode),
+    parent_wd_to_stale_node: std.AutoHashMap(i32, *WatchNode),
     thread: ?std.Thread = null,
     running: bool = false,
 
@@ -46,6 +49,7 @@ pub const Watcher = struct {
             .output_chan = .{ .allocator = allocator },
             .path_to_node = std.StringHashMap(*WatchNode).init(allocator),
             .wd_to_node = std.AutoHashMap(i32, *WatchNode).init(allocator),
+            .parent_wd_to_stale_node = std.AutoHashMap(i32, *WatchNode).init(allocator),
         };
         return self;
     }
@@ -62,6 +66,7 @@ pub const Watcher = struct {
         }
         self.path_to_node.deinit();
         self.wd_to_node.deinit();
+        self.parent_wd_to_stale_node.deinit();
         self.allocator.destroy(self);
     }
 
@@ -76,12 +81,18 @@ pub const Watcher = struct {
         }
     }
 
-    fn addWatchRecursive(self: *Watcher, fd: i32, path: []const u8, recursive: bool) !void {
+    fn addWatchInternal(self: *Watcher, fd: i32, path: []const u8, recursive: bool) !i32 {
+        _ = recursive;
         const path_c = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_c);
 
         const wd_usize = std.os.linux.inotify_add_watch(fd, path_c.ptr, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE | std.os.linux.IN.DELETE_SELF | std.os.linux.IN.MOVE_SELF);
         const wd: i32 = @intCast(wd_usize);
+        return wd;
+    }
+
+    fn addWatchRecursive(self: *Watcher, fd: i32, path: []const u8, recursive: bool) !void {
+        const wd = try self.addWatchInternal(fd, path, recursive);
         if (wd < 0) return;
 
         if (!self.path_to_node.contains(path)) {
@@ -116,7 +127,6 @@ pub const Watcher = struct {
 
         var buf: [8192]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
         while (self.running) {
-            // Drain requests
             while (self.input_chan.tryPop()) |req| {
                 switch (req) {
                     .Add => |add| try self.addWatchRecursive(fd, add.path, add.recursive),
@@ -132,7 +142,6 @@ pub const Watcher = struct {
                 }
             }
 
-            // Read events non-blocking
             const len_isize = std.os.linux.read(fd, &buf, buf.len);
             const len_err = @as(isize, @bitCast(len_isize));
             if (len_err > 0) {
@@ -140,17 +149,30 @@ pub const Watcher = struct {
                 var i: usize = 0;
                 while (i < len) {
                     const event = @as(*const std.os.linux.inotify_event, @ptrCast(@alignCast(&buf[i])));
+                    
                     if (self.wd_to_node.get(event.wd)) |node| {
-                        if (event.len > 0) {
+                        if (event.mask & (std.os.linux.IN.DELETE_SELF | std.os.linux.IN.MOVE_SELF) != 0) {
+                            // Directory deleted or moved - it's now stale
+                            node.is_stale = true;
+                            _ = self.wd_to_node.remove(event.wd);
+                            
+                            // Try to watch parent
+                            const parent_path = std.fs.path.dirname(node.path) orelse ".";
+                            const parent_wd = try self.addWatchInternal(fd, parent_path, false);
+                            if (parent_wd >= 0) {
+                                node.parent_wd = parent_wd;
+                                try self.parent_wd_to_stale_node.put(parent_wd, node);
+                            }
+                            try self.output_chan.push(.{ .Removed = try self.allocator.dupe(u8, node.path) });
+                        } else if (event.len > 0) {
                             const name_ptr = @as([*]const u8, @ptrCast(event)) + @sizeOf(std.os.linux.inotify_event);
                             const actual_name_len = std.mem.indexOfScalar(u8, name_ptr[0..event.len], 0) orelse event.len;
                             const name = name_ptr[0..actual_name_len];
-                            
                             const full_path = try std.fs.path.join(self.allocator, &.{ node.path, name });
-                            
+                            defer self.allocator.free(full_path);
+
                             if (event.mask & (std.os.linux.IN.CREATE | std.os.linux.IN.MOVED_TO) != 0) {
                                 try self.output_chan.push(.{ .Added = try self.allocator.dupe(u8, full_path) });
-                                // If a directory was created and we are in recursive mode, watch it
                                 if (node.recursive) {
                                     const stat = std.fs.cwd().statFile(full_path) catch null;
                                     if (stat != null and stat.?.kind == .directory) {
@@ -162,9 +184,30 @@ pub const Watcher = struct {
                             } else if (event.mask & std.os.linux.IN.MODIFY != 0) {
                                 try self.output_chan.push(.{ .Modified = try self.allocator.dupe(u8, full_path) });
                             }
-                            self.allocator.free(full_path);
                         } else {
                             try self.output_chan.push(.{ .Modified = try self.allocator.dupe(u8, node.path) });
+                        }
+                    } else if (self.parent_wd_to_stale_node.get(event.wd)) |stale_node| {
+                        // Event in parent of a stale node
+                        if (event.mask & (std.os.linux.IN.CREATE | std.os.linux.IN.MOVED_TO) != 0) {
+                            const name_ptr = @as([*]const u8, @ptrCast(event)) + @sizeOf(std.os.linux.inotify_event);
+                            const actual_name_len = std.mem.indexOfScalar(u8, name_ptr[0..event.len], 0) orelse event.len;
+                            const name = name_ptr[0..actual_name_len];
+                            const node_name = std.fs.path.basename(stale_node.path);
+                            
+                            if (std.mem.eql(u8, name, node_name)) {
+                                // Stale directory is back!
+                                const new_wd = try self.addWatchInternal(fd, stale_node.path, stale_node.recursive);
+                                if (new_wd >= 0) {
+                                    stale_node.wd = new_wd;
+                                    stale_node.is_stale = false;
+                                    try self.wd_to_node.put(new_wd, stale_node);
+                                    _ = self.parent_wd_to_stale_node.remove(event.wd);
+                                    // Optionally stop watching parent if no other stale nodes depend on it
+                                    // For simplicity, we keep it for now or rely on fetchRemove logic if we had a refcount
+                                    try self.output_chan.push(.{ .Added = try self.allocator.dupe(u8, stale_node.path) });
+                                }
+                            }
                         }
                     }
                     i += @sizeOf(std.os.linux.inotify_event) + event.len;
