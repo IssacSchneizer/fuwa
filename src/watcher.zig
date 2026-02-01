@@ -32,15 +32,17 @@ pub const Watcher = struct {
 
     fn watchLinux(self: *Watcher, path: []const u8) !void {
         const fd_usize = std.os.linux.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
-        if (@as(isize, @bitCast(fd_usize)) < 0) return error.InotifyInitFailed;
+        const fd_isize = @as(isize, @bitCast(fd_usize));
+        if (fd_isize < 0) return error.InotifyInitFailed;
         const fd: i32 = @intCast(fd_usize);
         defer _ = std.os.linux.close(fd);
 
         const path_c = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_c);
 
-        const wd = std.os.linux.inotify_add_watch(fd, path_c.ptr, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE);
-        if (@as(isize, @bitCast(wd)) < 0) return error.InotifyWatchFailed;
+        const wd_usize = std.os.linux.inotify_add_watch(fd, path_c.ptr, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE);
+        const wd_isize = @as(isize, @bitCast(wd_usize));
+        if (wd_isize < 0) return error.InotifyWatchFailed;
 
         var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
         while (true) {
@@ -57,10 +59,11 @@ pub const Watcher = struct {
 
             var i: usize = 0;
             while (i < len) {
-                const event = @as(*const std.os.linux.inotify_event, @ptrCast(@alignCast(&buf[i])));
+                const event_ptr = @as([*]const u8, @ptrCast(&buf[i]));
+                const event = @as(*const std.os.linux.inotify_event, @ptrCast(@alignCast(event_ptr)));
                 
                 if (event.len > 0) {
-                    const name_ptr = @as([*]const u8, @ptrCast(event)) + @sizeOf(std.os.linux.inotify_event);
+                    const name_ptr = event_ptr + @sizeOf(std.os.linux.inotify_event);
                     const name = std.mem.sliceTo(name_ptr[0..event.len], 0);
                     if (name.len > 0) {
                         self.callback(name);
